@@ -28,4 +28,40 @@ def upsample(channel, target_h, target_w):
     col_idx = np.clip(col_idx, 0, w - 1)
     return channel[row_idx][:, col_idx]
 
-# -----------------------
+def upsample_bilinear(channel, target_h, target_w):
+    """
+    色度升樣 B Bilinear Interpolation (高效能 Numpy 版)
+    """
+    h, w = channel.shape
+    if h == target_h and w == target_w:
+        return channel
+    # 1. 產生網格座標 (Vectorized)
+    # 對應你原本的 for x_t, for y_t
+    x = np.linspace(0, w - 1, target_w)
+    y = np.linspace(0, h - 1, target_h)
+    
+    # 2. 找到最近的整數座標 (x1, y1, x2, y2)
+    x0 = np.floor(x).astype(int)
+    x1 = np.clip(x0 + 1, 0, w - 1)
+    y0 = np.floor(y).astype(int)
+    y1 = np.clip(y0 + 1, 0, h - 1)
+    
+    # 3. 計算權重 (Broadcasting)
+    # 對應你原本的 x_diff, y_diff
+    wx = (x - x0).reshape(1, -1) # 形狀變 (1, W)
+    wy = (y - y0).reshape(-1, 1) # 形狀變 (H, 1)
+    
+    # 4. 一次取出所有像素值 (Fancy Indexing)
+    # 對應你原本的 p11, p12...
+    Ia = channel[y0[:, None], x0] # Top-Left
+    Ib = channel[y1[:, None], x0] # Bottom-Left
+    Ic = channel[y0[:, None], x1] # Top-Right
+    Id = channel[y1[:, None], x1] # Bottom-Right
+    
+    # 5. 一次算出整張圖的結果
+    result = (Ia * (1 - wx) * (1 - wy) +
+              Ic * wx       * (1 - wy) +
+              Ib * (1 - wx) * wy +
+              Id * wx       * wy)
+              
+    return np.clip(result, 0, 255).astype(channel.dtype)
