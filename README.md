@@ -2,28 +2,17 @@
 
 本分支新增與改良以下內容：
 
-### 新增/優化的 IDCT 方法
+### 新增的 IDCT 方法
 
-  -----------------------------------------------------------------------
-  名稱                                說明
-  ----------------------------------- -----------------------------------
-  `inverse_dct_block_vectorized64`    **最快、精度最高** 的 64×64
-                                      完全向量化版本
-
-  `inverse_dct_block_matmul`          根據 IDCT 公式推導的 8×8
-                                      矩陣運算版本（`C @ X @ C.T`）
-
-  `inverse_dct_block_aan`             AAN 快速演算法的向量化版本
-
-  `inverse_dct_block_fft`             使用 FFT 推導之 IDCT（屬近似法）
-
-  `inverse_dct_block_separable`       傳統逐列/逐行的 1D IDCT（慢但精準）
-
-  `inverse_dct_block_direct`          使用預計算基底矩陣的直接 IDCT
-
-  baseline（scipy）                   `scipy.fftpack.idct`，作為 Ground Truth
-                                                 
-  -----------------------------------------------------------------------
+| 名稱                         | 說明                                       |
+|------------------------------|--------------------------------------------|
+| `inverse_dct_block_vectorized64` | **最快、精度最高** 的 64×64 完全向量化版本 |
+| `inverse_dct_block_matmul`       | 根據 IDCT 公式推導的 8×8 矩陣運算版本（`C @ X @ C.T`） |
+| `inverse_dct_block_aan`          | AAN 快速演算法的向量化版本 |
+| `inverse_dct_block_fft`          | 使用 FFT 推導之 IDCT（屬近似法） |
+| `inverse_dct_block_separable`    | 傳統逐列/逐行的 1D IDCT（慢但精準） |
+| `inverse_dct_block_direct`       | 使用預計算基底矩陣的直接 IDCT |
+| baseline（scipy）                | `scipy.fftpack.idct`，作為 Ground Truth |
   
 
 ### 新增 `benchmark_idct_methods()`
