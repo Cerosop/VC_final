@@ -36,6 +36,11 @@ def _inverse_zigzag(coeffs):
     return out
 
 
+# 全圖共用 Huffman 的全域狀態（由 prepare_huff_global 建立）
+_GLOBAL_HUFF_ROOT = None
+_GLOBAL_HUFF_CODES = None
+
+
 # 簡單 Huffman 樹
 class _Node:
     __slots__ = ('left','right','sym','freq')
@@ -110,11 +115,36 @@ def _rle_decode(symbols):
     return coeffs
 
 
-def encode_block(block):
+def prepare_huff_global(blocks):
+    """
+    根據整張圖（所有量化後 8x8 block）的 RLE 符號建立一棵「全圖共用」的 Huffman 樹。
+    會將結果儲存在模組全域變數 _GLOBAL_HUFF_ROOT / _GLOBAL_HUFF_CODES 中。
+    """
+    global _GLOBAL_HUFF_ROOT, _GLOBAL_HUFF_CODES
+
+    freqs = {}
+    for block in blocks:
+        block = np.asarray(block)
+        zz = _zigzag_flatten(block)
+        symbols = _rle_encode(zz)
+        for s in symbols:
+            freqs[s] = freqs.get(s, 0) + 1
+
+    root = _build_huffman(freqs)
+    codes = _gen_codes(root)
+
+    _GLOBAL_HUFF_ROOT = root
+    _GLOBAL_HUFF_CODES = codes
+
+# -------------------------------------------------------------------------
+# Method 1: Huffman (原版，Per-block Huffman)
+# -------------------------------------------------------------------------
+
+def encode_block_huff(block):
     """
     將量化後的 8x8 區塊轉為 Bitstream：
     - Zigzag -> RLE(零) -> 建立 Huffman Tree -> 逐 bit 編碼
-    回傳：{"codec":"huff_rle_zigzag_v1","tree":root_node,"bits":str}
+    回傳：{"codec":"huff","tree":root_node,"bits":str}
     """
     block = np.asarray(block)
     zz = _zigzag_flatten(block)
@@ -129,42 +159,166 @@ def encode_block(block):
 
     bits = ''.join(codes[s] for s in symbols)
     return {
-        'codec': 'huff_rle_zigzag_v1',
+        'codec': 'huff',
         'tree': root,
         'bits': bits,
     }
 
-def decode_block(stream_data):
+def decode_block_huff(stream_data):
     """
     將 Bitstream 解碼回 8x8 量化區塊：
     - 逐 bit 讀取，沿 Huffman 樹遍歷至葉節點取得符號
     - 反 RLE -> 反 Zigzag
     """
-    if isinstance(stream_data, np.ndarray):
-        # 兼容舊格式：直接回傳
+    # 兼容舊格式：若不是 dict，直接視為已是量化區塊
+    if not isinstance(stream_data, dict):
         return stream_data
 
-    if not isinstance(stream_data, dict) or stream_data.get('codec') != 'huff_rle_zigzag_v1':
-        # 無法辨識就原封不動回傳
+    codec = stream_data.get('codec')
+    # 若不是 huff / huff_global 編碼，直接回傳（讓其他 decode_* 處理）
+    if codec not in ('huff', 'huff_global'):
         return stream_data
 
     root = stream_data['tree']
     bits = stream_data['bits']
 
-    # bit-by-bit 遍歷
-    symbols = []
-    node = root
-    for b in bits:
-        node = node.left if b == '0' else node.right
-        if node.sym is not None:
-            symbols.append(node.sym)
-            node = root
-            # 提前終止：遇到 EOB 且已足夠
-            if symbols[-1] == ('EOB',):
+    # 特殊情況：退化 Huffman 樹（只有一個符號）
+    # 這時 root 是葉節點，沒有 left/right，可以直接依 bits 長度複製同一個符號。
+    if getattr(root, "left", None) is None and getattr(root, "right", None) is None:
+        if not bits:
+            symbols = [root.sym]
+        else:
+            symbols = [root.sym] * len(bits)
+    else:
+        # 一般情況：bit-by-bit 順著樹走
+        symbols = []
+        node = root
+        for b in bits:
+            node = node.left if b == '0' else node.right
+            # 安全檢查：若 bit 序列異常導致走到 None，提前中止
+            if node is None:
                 break
+            if node.sym is not None:
+                symbols.append(node.sym)
+                node = root
+                # 提前終止：遇到 EOB 且已足夠
+                if symbols[-1] == ('EOB',):
+                    break
 
     coeffs = _rle_decode(symbols)
     block8 = _inverse_zigzag(coeffs)
     return block8
 
-# -----------------------
+
+def encode_block_huff_global(block):
+    """
+    使用「全圖共用」的 Huffman 樹進行編碼。
+    需先呼叫 prepare_huff_global 建立 _GLOBAL_HUFF_ROOT / _GLOBAL_HUFF_CODES；
+    若尚未建立，則退回到一般 per-block Huffman。
+    """
+    global _GLOBAL_HUFF_ROOT, _GLOBAL_HUFF_CODES
+
+    block = np.asarray(block)
+
+    if _GLOBAL_HUFF_ROOT is None or _GLOBAL_HUFF_CODES is None:
+        # 尚未準備好全域 Huffman，退回 per-block 版本避免崩潰
+        return encode_block_huff(block)
+
+    zz = _zigzag_flatten(block)
+    symbols = _rle_encode(zz)
+
+    bits = ''.join(_GLOBAL_HUFF_CODES[s] for s in symbols)
+    return {
+        'codec': 'huff_global',
+        'tree': _GLOBAL_HUFF_ROOT,
+        'bits': bits,
+    }
+
+
+def decode_block_huff_global(stream_data):
+    """
+    Global Huffman 版的解碼，實作上直接重用 decode_block_huff。
+    """
+    return decode_block_huff(stream_data)
+
+
+# -------------------------------------------------------------------------
+# Method 2: Raw (無壓縮，僅 Zigzag + 固定位元長度模擬)
+# -------------------------------------------------------------------------
+
+def encode_block_raw(block):
+    """
+    不壓縮模式：
+    - Zigzag 掃描
+    - 每個係數直接存 (模擬為 12 bits)
+    """
+    block = np.asarray(block)
+    zz = _zigzag_flatten(block)
+    
+    # 模擬 bitstream：每個係數 12 bits (假設係數範圍 -2048~2047)
+    # 這裡只為了計算大小，內容不重要，用 '0' 填充
+    # 真實儲存會存 zz list
+    bits_sim = '0' * (len(zz) * 12) 
+    
+    return {
+        'codec': 'raw',
+        'data': zz,
+        'bits': bits_sim
+    }
+
+def decode_block_raw(stream_data):
+    if not isinstance(stream_data, dict) or stream_data.get('codec') != 'raw':
+        return stream_data # Should not happen if matched correctly
+    
+    zz = stream_data['data']
+    block8 = _inverse_zigzag(zz)
+    return block8
+
+
+# -------------------------------------------------------------------------
+# Method 3: RLE Only (無 Huffman，僅 RLE)
+# -------------------------------------------------------------------------
+
+def encode_block_rle(block):
+    """
+    RLE 模式 (無 Huffman)：
+    - Zigzag -> RLE
+    - 模擬編碼：Run(4bits) + Value(12bits) = 16 bits per symbol
+    - EOB = 4 bits
+    """
+    block = np.asarray(block)
+    zz = _zigzag_flatten(block)
+    symbols = _rle_encode(zz)
+    
+    # 計算模擬的 bit 數
+    total_len = 0
+    for s in symbols:
+        if s == ('EOB',):
+            total_len += 4
+        else:
+            # (run, val) -> 4 bits run + 12 bits val
+            total_len += (4 + 12)
+            
+    bits_sim = '0' * total_len
+    
+    return {
+        'codec': 'rle',
+        'symbols': symbols,
+        'bits': bits_sim
+    }
+
+def decode_block_rle(stream_data):
+    if not isinstance(stream_data, dict) or stream_data.get('codec') != 'rle':
+        return stream_data
+        
+    symbols = stream_data['symbols']
+    coeffs = _rle_decode(symbols)
+    block8 = _inverse_zigzag(coeffs)
+    return block8
+
+# -------------------------------------------------------------------------
+# Default / Baseline Aliases
+# -------------------------------------------------------------------------
+# 讓 main.py 的 baseline 能繼續運作 (對應到 huff)
+encode_block = encode_block_huff
+decode_block = decode_block_huff
