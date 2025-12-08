@@ -30,8 +30,8 @@ def _zigzag_flatten(block8x8: np.ndarray):
     return coeffs
 
 def _inverse_zigzag(coeffs):
-    out = np.zeros((8,8), dtype=np.int32)
-    for (r,c), v in zip(_ZZ_IDX, coeffs):
+    out = np.zeros((8, 8), dtype=np.int32)
+    for (r, c), v in zip(_ZZ_IDX, coeffs):
         out[r, c] = v
     return out
 
@@ -39,6 +39,11 @@ def _inverse_zigzag(coeffs):
 # 全圖共用 Huffman 的全域狀態（由 prepare_huff_global 建立）
 _GLOBAL_HUFF_ROOT = None
 _GLOBAL_HUFF_CODES = None
+
+
+# JPEG-like DC 差分用的全域狀態
+_DC_PREDICTORS = {"Y": 0, "Cb": 0, "Cr": 0}
+_CURRENT_COMPONENT = "Y"  # 由 main.py 在處理 Y/Cb/Cr 前設定
 
 
 # 簡單 Huffman 樹
@@ -113,6 +118,25 @@ def _rle_decode(symbols):
     if len(coeffs) < 64:
         coeffs.extend([0] * (64 - len(coeffs)))
     return coeffs
+
+
+def reset_dc_predictors():
+    """
+    將 DC predictor 重設為 0。
+    需在每張圖開始（編碼與解碼各一次）呼叫。
+    """
+    global _DC_PREDICTORS
+    _DC_PREDICTORS = {"Y": 0, "Cb": 0, "Cr": 0}
+
+
+def set_current_component(name: str):
+    """
+    設定目前處理的分量（'Y' / 'Cb' / 'Cr'）。
+    由 main.py 在處理各 channel 迴圈前呼叫。
+    """
+    global _CURRENT_COMPONENT
+    if name in ("Y", "Cb", "Cr"):
+        _CURRENT_COMPONENT = name
 
 
 def prepare_huff_global(blocks):
@@ -240,6 +264,112 @@ def decode_block_huff_global(stream_data):
     Global Huffman 版的解碼，實作上直接重用 decode_block_huff。
     """
     return decode_block_huff(stream_data)
+
+
+# -------------------------------------------------------------------------
+# Method 5: Huffman with DC DPCM (JPEG-like, DC/AC 分離於預處理階段)
+# -------------------------------------------------------------------------
+
+
+def _apply_dc_dpcm_encode(coeffs):
+    """
+    對 Zigzag 展開後的 64 維係數做 DC 差分：
+    - coeffs[0] 會被替換成 (DC - predictor)，並更新 predictor。
+    - AC 係數維持不變。
+    """
+    global _DC_PREDICTORS, _CURRENT_COMPONENT
+    dc = coeffs[0]
+    pred = _DC_PREDICTORS.get(_CURRENT_COMPONENT, 0)
+    diff = int(dc - pred)
+    _DC_PREDICTORS[_CURRENT_COMPONENT] = int(dc)
+    out = list(coeffs)
+    out[0] = diff
+    return out
+
+
+def _apply_dc_dpcm_decode(coeffs):
+    """
+    對 Zigzag 展開後的 64 維係數做 DC 差分還原：
+    - coeffs[0] 視為 (DC - predictor)，恢復為真正的 DC 並更新 predictor。
+    """
+    global _DC_PREDICTORS, _CURRENT_COMPONENT
+    diff = int(coeffs[0])
+    pred = _DC_PREDICTORS.get(_CURRENT_COMPONENT, 0)
+    dc = pred + diff
+    _DC_PREDICTORS[_CURRENT_COMPONENT] = int(dc)
+    out = list(coeffs)
+    out[0] = dc
+    return out
+
+
+def encode_block_huff_dpcm(block):
+    """
+    Huffman + DC DPCM：
+    - Zigzag 展開後，先將 DC 係數做差分 (DPCM)，只對 AC 維持原本統計特性。
+    - 再將整個 64 維序列丟入 RLE + Huffman（每個 block 各自建樹）。
+
+    注意：為了簡化實作與維持與其他 method 相容，
+    我們仍以 per-block Huffman 編碼，僅在 DC 預處理階段做 DPCM。
+    """
+    block = np.asarray(block)
+    zz = _zigzag_flatten(block)
+    zz_dpcm = _apply_dc_dpcm_encode(zz)
+    symbols = _rle_encode(zz_dpcm)
+
+    # 建頻率表（per-block）
+    freqs = {}
+    for s in symbols:
+        freqs[s] = freqs.get(s, 0) + 1
+    root = _build_huffman(freqs)
+    codes = _gen_codes(root)
+
+    bits = ''.join(codes[s] for s in symbols)
+    return {
+        'codec': 'huff_dpcm',
+        'tree': root,
+        'bits': bits,
+    }
+
+
+def decode_block_huff_dpcm(stream_data):
+    """
+    Huffman + DC DPCM 的解碼：
+    - 與 decode_block_huff 類似，先還原出 64 維序列（其第 0 項為 DC diff）
+    - 再依照 DC predictor 還原真正 DC，最後反 Zigzag 成 8x8 block。
+    """
+    # 兼容舊格式：若不是 dict，直接視為已是量化區塊
+    if not isinstance(stream_data, dict):
+        return stream_data
+
+    if stream_data.get('codec') != 'huff_dpcm':
+        return stream_data
+
+    root = stream_data['tree']
+    bits = stream_data['bits']
+
+    # 處理可能的退化 Huffman 樹
+    if getattr(root, "left", None) is None and getattr(root, "right", None) is None:
+        if not bits:
+            symbols = [root.sym]
+        else:
+            symbols = [root.sym] * len(bits)
+    else:
+        symbols = []
+        node = root
+        for b in bits:
+            node = node.left if b == '0' else node.right
+            if node is None:
+                break
+            if node.sym is not None:
+                symbols.append(node.sym)
+                node = root
+                if symbols[-1] == ('EOB',):
+                    break
+
+    coeffs = _rle_decode(symbols)
+    coeffs = _apply_dc_dpcm_decode(coeffs)
+    block8 = _inverse_zigzag(coeffs)
+    return block8
 
 
 # -------------------------------------------------------------------------
