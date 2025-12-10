@@ -60,7 +60,7 @@ def jpeg_pipeline(img_arr, dct_method='baseline', idct_method='baseline',
     # 為了計算壓縮率，我們需要收集量化後的 block
     quantized_Y_blocks = []
     quantized_C_blocks = []
-
+    
     # Select functions for pipeline
     forward_dct_fn = _resolve_func(transforms, 'forward_dct_block', dct_method)
     inverse_dct_fn = _resolve_func(transforms, 'inverse_dct_block', idct_method)
@@ -78,29 +78,87 @@ def jpeg_pipeline(img_arr, dct_method='baseline', idct_method='baseline',
         'entropy': entropy_method,
     }
 
-    # Process Y
-    for block in Y_blocks:
-        dct_block = forward_dct_fn(block)
-        q_block = quantize_fn(dct_block, config.Q_Y) # 量化
-        stream = encode_block_fn(q_block)
+    # 將 DC predictor 重設，確保每張圖的 DPCM 從 0 開始
+    entropy.reset_dc_predictors()
+
+    if entropy_method == 'huff_global':
+        # ----------------- Global Huffman 版本 -----------------
+        # 先對所有 block 做 DCT + 量化，收集量化後的係數
+        quantized_Y_blocks = []
+        quantized_Cb_blocks = []
+        quantized_Cr_blocks = []
         
-        encoded_data['Y'].append(stream)
-        quantized_Y_blocks.append(q_block) # 收集起來算非零係數
-
-    # Process Cb/Cr
-    for block in Cb_blocks:
-        dct_block = forward_dct_fn(block)
-        q_block = quantize_fn(dct_block, config.Q_C)
-        stream = encode_block_fn(q_block)
-        encoded_data['Cb'].append(stream)
-        quantized_C_blocks.append(q_block)
-
-    for block in Cr_blocks:
-        dct_block = forward_dct_fn(block)
-        q_block = quantize_fn(dct_block, config.Q_C)
-        stream = encode_block_fn(q_block)
-        encoded_data['Cr'].append(stream)
-        quantized_C_blocks.append(q_block)
+        # Y channel
+        entropy.set_current_component('Y')
+        for block in Y_blocks:
+            dct_block = forward_dct_fn(block)
+            q_block = quantize_fn(dct_block, config.Q_Y)
+            quantized_Y_blocks.append(q_block)
+        
+        # Cb channel
+        entropy.set_current_component('Cb')
+        for block in Cb_blocks:
+            dct_block = forward_dct_fn(block)
+            q_block = quantize_fn(dct_block, config.Q_C)
+            quantized_Cb_blocks.append(q_block)
+        
+        # Cr channel
+        entropy.set_current_component('Cr')
+        for block in Cr_blocks:
+            dct_block = forward_dct_fn(block)
+            q_block = quantize_fn(dct_block, config.Q_C)
+            quantized_Cr_blocks.append(q_block)
+        
+        # 合併色度 block 以計算 sparsity
+        quantized_C_blocks = quantized_Cb_blocks + quantized_Cr_blocks
+        
+        # 根據整張圖的所有量化係數建立「全圖共用」 Huffman
+        all_blocks = quantized_Y_blocks + quantized_Cb_blocks + quantized_Cr_blocks
+        entropy.prepare_huff_global(all_blocks)
+        
+        # 使用 global Huffman 對每個 block 做編碼
+        entropy.set_current_component('Y')
+        for q_block in quantized_Y_blocks:
+            stream = encode_block_fn(q_block)  # encode_block_huff_global
+            encoded_data['Y'].append(stream)
+        
+        entropy.set_current_component('Cb')
+        for q_block in quantized_Cb_blocks:
+            stream = encode_block_fn(q_block)
+            encoded_data['Cb'].append(stream)
+        
+        entropy.set_current_component('Cr')
+        for q_block in quantized_Cr_blocks:
+            stream = encode_block_fn(q_block)
+            encoded_data['Cr'].append(stream)
+    else:
+        # ----------------- 一般（per-block）版本 -----------------
+        # Process Y
+        entropy.set_current_component('Y')
+        for block in Y_blocks:
+            dct_block = forward_dct_fn(block)
+            q_block = quantize_fn(dct_block, config.Q_Y) # 量化
+            stream = encode_block_fn(q_block)
+            
+            encoded_data['Y'].append(stream)
+            quantized_Y_blocks.append(q_block) # 收集起來算非零係數
+        
+        # Process Cb/Cr
+        entropy.set_current_component('Cb')
+        for block in Cb_blocks:
+            dct_block = forward_dct_fn(block)
+            q_block = quantize_fn(dct_block, config.Q_C)
+            stream = encode_block_fn(q_block)
+            encoded_data['Cb'].append(stream)
+            quantized_C_blocks.append(q_block)
+        
+        entropy.set_current_component('Cr')
+        for block in Cr_blocks:
+            dct_block = forward_dct_fn(block)
+            q_block = quantize_fn(dct_block, config.Q_C)
+            stream = encode_block_fn(q_block)
+            encoded_data['Cr'].append(stream)
+            quantized_C_blocks.append(q_block)
         
     stats['time_encoding'] = (time.time() - t0) * 1000
 
@@ -136,8 +194,12 @@ def jpeg_pipeline(img_arr, dct_method='baseline', idct_method='baseline',
 
     # --- DECODER ---
     t0 = time.time()
+
+    # 解碼前也需重設 DC predictor，並依 Y/Cb/Cr 的順序與編碼一致
+    entropy.reset_dc_predictors()
     
     # Y Reconstruction
+    entropy.set_current_component('Y')
     Y_recon_blocks = []
     for stream in encoded_data['Y']:
         q_block = decode_block_fn(stream)
@@ -148,6 +210,7 @@ def jpeg_pipeline(img_arr, dct_method='baseline', idct_method='baseline',
     
     # Cb/Cr Loop
     Cb_recon_blocks = []
+    entropy.set_current_component('Cb')
     for stream in encoded_data['Cb']:
         q_block = decode_block_fn(stream)
         dct_block = dequantize_fn(q_block, config.Q_C)
@@ -156,6 +219,7 @@ def jpeg_pipeline(img_arr, dct_method='baseline', idct_method='baseline',
     Cb_recon_sub = utils.reconstruct_from_blocks(Cb_recon_blocks, h_c, w_c)
 
     Cr_recon_blocks = []
+    entropy.set_current_component('Cr')
     for stream in encoded_data['Cr']:
         q_block = decode_block_fn(stream)
         dct_block = dequantize_fn(q_block, config.Q_C)
