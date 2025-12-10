@@ -15,7 +15,7 @@ from experiments.experiment_entropy import run_entropy_comparison  # 重用單�
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 # 與 experiment_entropy.py 中的 methods 保持一致
-ENTROPY_METHODS = ["raw", "rle", "huff", "huff_global", "huff_dpcm"]
+ENTROPY_METHODS = ["raw", "rle", "huff", "huff_global", "huff_dpcm", "huff_dcac_shared"]
 
 
 def run_entropy_experiments(image_dir: Path, output_csv: Path) -> None:

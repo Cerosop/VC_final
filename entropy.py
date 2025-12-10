@@ -39,12 +39,21 @@ def _inverse_zigzag(coeffs):
 # 全圖共用 Huffman 的全域狀態（由 prepare_huff_global 建立）
 _GLOBAL_HUFF_ROOT = None
 _GLOBAL_HUFF_CODES = None
+_GLOBAL_HUFF_TABLE_BITS = 0
 
 
 # JPEG-like DC 差分用的全域狀態
 _DC_PREDICTORS = {"Y": 0, "Cb": 0, "Cr": 0}
 _CURRENT_COMPONENT = "Y"  # 由 main.py 在處理 Y/Cb/Cr 前設定
 
+# Shared DC/AC Huffman (JPEG-like DC/AC 分表，共用碼表；改為 per-component)
+# dict[comp_name] -> codes / trees
+_SHARED_DC_CODES_MAP = {}
+_SHARED_DC_TREES_MAP = {}
+_SHARED_AC_CODES_MAP = {}
+_SHARED_AC_TREES_MAP = {}
+_SHARED_DC_TABLE_BITS_MAP = {}
+_SHARED_AC_TABLE_BITS_MAP = {}
 
 # 簡單 Huffman 樹
 class _Node:
@@ -67,6 +76,14 @@ def _build_huffman(freqs):
         parent = _Node(sym=None, freq=a.freq + b.freq, left=a, right=b)
         nodes.append(parent)
     return nodes[0]
+
+def _estimate_table_bits_from_codes(codes: dict) -> int:
+    """
+    粗估 Huffman 表的 signaling 開銷（不追求位元精確，只求公平比較）：
+    - 以 canonical 觀念，每個符號存 code length (~5 bits) + 符號標識 (~8 bits)
+    - 預留一點 header，最低 16 bits
+    """
+    return max(16, len(codes) * 13)
 
 def _gen_codes(node, prefix='', out=None):
     if out is None:
@@ -139,12 +156,65 @@ def set_current_component(name: str):
         _CURRENT_COMPONENT = name
 
 
+# --- Bit helpers for JPEG-like DC/AC coding ---------------------------------
+
+
+def _bit_length_for_value(v: int) -> int:
+    """Number of bits to represent |v| in JPEG magnitude coding."""
+    if v == 0:
+        return 0
+    return int(np.floor(np.log2(abs(v)))) + 1
+
+
+def _value_to_bits(v: int, size: int) -> str:
+    """
+    JPEG magnitude bits for given value and category size.
+    Positive: binary of v
+    Negative: (1<<size) - 1 + v
+    """
+    if size == 0:
+        return ""
+    if v >= 0:
+        return f"{v & ((1<<size)-1):0{size}b}"
+    # negative
+    return f"{((1<<size) - 1 + v) & ((1<<size)-1):0{size}b}"
+
+
+def _receive_extend_bits(bitreader, size: int) -> int:
+    """
+    依 JPEG 的 receive/extend 邏輯還原帶符號值。
+    bitreader: 提供 read(n) 回傳 int 的物件
+    """
+    if size == 0:
+        return 0
+    v = bitreader.read(size)
+    if v < (1 << (size - 1)):
+        v -= (1 << size) - 1
+    return v
+
+
+class _BitStrReader:
+    """簡單的 bitreader，從字串 (e.g., '01011') 依序讀取 bits。"""
+    def __init__(self, bitstr: str):
+        self.bitstr = bitstr
+        self.pos = 0
+
+    def read(self, n: int) -> int:
+        if n == 0:
+            return 0
+        if self.pos + n > len(self.bitstr):
+            raise EOFError("Not enough bits to read")
+        val = int(self.bitstr[self.pos:self.pos+n], 2)
+        self.pos += n
+        return val
+
+
 def prepare_huff_global(blocks):
     """
     根據整張圖（所有量化後 8x8 block）的 RLE 符號建立一棵「全圖共用」的 Huffman 樹。
     會將結果儲存在模組全域變數 _GLOBAL_HUFF_ROOT / _GLOBAL_HUFF_CODES 中。
     """
-    global _GLOBAL_HUFF_ROOT, _GLOBAL_HUFF_CODES
+    global _GLOBAL_HUFF_ROOT, _GLOBAL_HUFF_CODES, _GLOBAL_HUFF_TABLE_BITS
 
     freqs = {}
     for block in blocks:
@@ -159,6 +229,93 @@ def prepare_huff_global(blocks):
 
     _GLOBAL_HUFF_ROOT = root
     _GLOBAL_HUFF_CODES = codes
+    _GLOBAL_HUFF_TABLE_BITS = _estimate_table_bits_from_codes(codes)
+
+
+def _build_prefix_tree_from_codes(codes: dict):
+    """
+    將 sym -> bitstr 的 dict 轉為 prefix tree，便於解碼。
+    """
+    tree = {}
+    for sym, bitstr in codes.items():
+        bitstr = str(bitstr)
+        if bitstr == "":
+            # 單節點退化情況：直接標上 sym
+            tree["sym"] = sym
+            continue
+        node = tree
+        for b in bitstr:
+            node = node.setdefault(b, {})
+        node["sym"] = sym
+    return tree
+
+
+def prepare_huff_dcac_shared(blocks_by_comp: dict):
+    """
+    建立 JPEG-like 的「共用 DC/AC Huffman 表」（改為 per-component）：
+    - blocks_by_comp: dict{name->[quantized_blocks]}，例如 {'Y': [...], 'Cb': [...], 'Cr': [...]}
+    - DC 使用 DPCM，AC 使用 (run,size) 符號；ZRL=0xF0, EOB=0x00
+    產生全域 per-component 的 codes/trees
+    """
+    global _SHARED_DC_CODES_MAP, _SHARED_DC_TREES_MAP, _SHARED_AC_CODES_MAP, _SHARED_AC_TREES_MAP
+    global _SHARED_DC_TABLE_BITS_MAP, _SHARED_AC_TABLE_BITS_MAP
+    _SHARED_DC_CODES_MAP = {}
+    _SHARED_DC_TREES_MAP = {}
+    _SHARED_AC_CODES_MAP = {}
+    _SHARED_AC_TREES_MAP = {}
+    _SHARED_DC_TABLE_BITS_MAP = {}
+    _SHARED_AC_TABLE_BITS_MAP = {}
+
+    for comp_name, comp_blocks in blocks_by_comp.items():
+        dc_freq = {}
+        ac_freq = {}
+        dc_pred = 0
+        for block in comp_blocks:
+            zz = _zigzag_flatten(block)
+            # DC
+            dc = int(zz[0])
+            diff = dc - dc_pred
+            dc_pred = dc
+            size = _bit_length_for_value(diff)
+            dc_freq[size] = dc_freq.get(size, 0) + 1
+
+            # AC
+            run = 0
+            last_nz = 0
+            for i in range(63, 0, -1):
+                if zz[i] != 0:
+                    last_nz = i
+                    break
+            for idx in range(1, last_nz + 1):
+                v = int(zz[idx])
+                if v == 0:
+                    run += 1
+                    if run == 16:
+                        ac_freq[0xF0] = ac_freq.get(0xF0, 0) + 1  # ZRL
+                        run = 0
+                else:
+                    size_v = _bit_length_for_value(v)
+                    sym = (run << 4) | size_v
+                    ac_freq[sym] = ac_freq.get(sym, 0) + 1
+                    run = 0
+            ac_freq[0x00] = ac_freq.get(0x00, 0) + 1  # EOB
+
+        if not dc_freq:
+            dc_freq = {0: 1}
+        if not ac_freq:
+            ac_freq = {0x00: 1}
+
+        dc_root = _build_huffman(dc_freq)
+        ac_root = _build_huffman(ac_freq)
+        dc_codes = _gen_codes(dc_root)
+        ac_codes = _gen_codes(ac_root)
+
+        _SHARED_DC_CODES_MAP[comp_name] = dc_codes
+        _SHARED_AC_CODES_MAP[comp_name] = ac_codes
+        _SHARED_DC_TREES_MAP[comp_name] = _build_prefix_tree_from_codes(dc_codes)
+        _SHARED_AC_TREES_MAP[comp_name] = _build_prefix_tree_from_codes(ac_codes)
+        _SHARED_DC_TABLE_BITS_MAP[comp_name] = _estimate_table_bits_from_codes(dc_codes)
+        _SHARED_AC_TABLE_BITS_MAP[comp_name] = _estimate_table_bits_from_codes(ac_codes)
 
 # -------------------------------------------------------------------------
 # Method 1: Huffman (原版，Per-block Huffman)
@@ -186,6 +343,7 @@ def encode_block_huff(block):
         'codec': 'huff',
         'tree': root,
         'bits': bits,
+        'table_bits': _estimate_table_bits_from_codes(codes),
     }
 
 def decode_block_huff(stream_data):
@@ -226,7 +384,7 @@ def decode_block_huff(stream_data):
                 symbols.append(node.sym)
                 node = root
                 # 提前終止：遇到 EOB 且已足夠
-                if symbols[-1] == ('EOB',):
+                if symbols and symbols[-1] == ('EOB',):
                     break
 
     coeffs = _rle_decode(symbols)
@@ -256,6 +414,7 @@ def encode_block_huff_global(block):
         'codec': 'huff_global',
         'tree': _GLOBAL_HUFF_ROOT,
         'bits': bits,
+        # 表的成本由 prepare_huff_global 記錄，全圖只算一次；在 main 統一加上
     }
 
 
@@ -328,6 +487,7 @@ def encode_block_huff_dpcm(block):
         'codec': 'huff_dpcm',
         'tree': root,
         'bits': bits,
+        'table_bits': _estimate_table_bits_from_codes(codes),
     }
 
 
@@ -368,6 +528,133 @@ def decode_block_huff_dpcm(stream_data):
 
     coeffs = _rle_decode(symbols)
     coeffs = _apply_dc_dpcm_decode(coeffs)
+    block8 = _inverse_zigzag(coeffs)
+    return block8
+
+
+# -------------------------------------------------------------------------
+# Method 6: JPEG-like DC/AC shared Huffman (DC DPCM + AC (run,size) + 共用表)
+# -------------------------------------------------------------------------
+
+
+def encode_block_huff_dcac_shared(block):
+    """
+    使用共用 DC/AC Huffman 表（需先呼叫 prepare_huff_dcac_shared）。
+    - DC: DPCM 後以「size」做 Huffman，接 magnitude bits。
+    - AC: 符號 = (run,size)，ZRL=0xF0，EOB=0x00，接 magnitude bits。
+    bitstream 以字串保存，用於統計長度；同時回傳樹以便解碼。
+    """
+    global _SHARED_DC_CODES, _SHARED_AC_CODES, _CURRENT_COMPONENT, _DC_PREDICTORS
+
+    dc_codes = _SHARED_DC_CODES_MAP.get(_CURRENT_COMPONENT)
+    ac_codes = _SHARED_AC_CODES_MAP.get(_CURRENT_COMPONENT)
+    if dc_codes is None or ac_codes is None:
+        # 尚未準備好共用表，退回 per-block Huffman
+        return encode_block_huff(block)
+
+    block = np.asarray(block)
+    zz = _zigzag_flatten(block)
+
+    # DC
+    dc = int(zz[0])
+    pred = _DC_PREDICTORS.get(_CURRENT_COMPONENT, 0)
+    diff = dc - pred
+    _DC_PREDICTORS[_CURRENT_COMPONENT] = dc
+    size_dc = _bit_length_for_value(diff)
+    dc_bits = _value_to_bits(diff, size_dc)
+    dc_code = dc_codes.get(size_dc, '')
+
+    # AC
+    ac_bitstr = ""
+    run = 0
+    last_nz = 0
+    for i in range(63, 0, -1):
+        if zz[i] != 0:
+            last_nz = i
+            break
+    for idx in range(1, last_nz + 1):
+        v = int(zz[idx])
+        if v == 0:
+            run += 1
+            if run == 16:
+                # ZRL
+                ac_bitstr += ac_codes.get(0xF0, '')
+                run = 0
+        else:
+            size_v = _bit_length_for_value(v)
+            sym = (run << 4) | size_v
+            ac_bitstr += ac_codes.get(sym, '')
+            ac_bitstr += _value_to_bits(v, size_v)
+            run = 0
+    # EOB
+    ac_bitstr += ac_codes.get(0x00, '')
+
+    bits = dc_code + dc_bits + ac_bitstr
+    return {
+        'codec': 'huff_dcac_shared',
+        'bits': bits,
+        # 表成本在 prepare_huff_dcac_shared 記錄，全圖每分量只算一次；main 統一加上
+    }
+
+
+def decode_block_huff_dcac_shared(stream_data):
+    """
+    解碼共用 DC/AC Huffman 表的 bitstream。
+    - 需先呼叫 prepare_huff_dcac_shared 建立全域樹。
+    - 使用 _CURRENT_COMPONENT 的 DC predictor。
+    """
+    global _SHARED_DC_TREE, _SHARED_AC_TREE, _DC_PREDICTORS, _CURRENT_COMPONENT
+
+    if not isinstance(stream_data, dict) or stream_data.get('codec') != 'huff_dcac_shared':
+        return stream_data
+
+    dc_tree = _SHARED_DC_TREES_MAP.get(_CURRENT_COMPONENT)
+    ac_tree = _SHARED_AC_TREES_MAP.get(_CURRENT_COMPONENT)
+    if dc_tree is None or ac_tree is None:
+        return stream_data
+
+    bitreader = _BitStrReader(stream_data['bits'])
+
+    # DC decode
+    node = dc_tree
+    while "sym" not in node:
+        b = bitreader.read(1)
+        node = node.get("1" if b else "0")
+        if node is None:
+            raise ValueError("Invalid DC Huffman code")
+    size_dc = node["sym"]
+    diff = _receive_extend_bits(bitreader, size_dc)
+    pred = _DC_PREDICTORS.get(_CURRENT_COMPONENT, 0)
+    dc = pred + diff
+    _DC_PREDICTORS[_CURRENT_COMPONENT] = dc
+
+    coeffs = [0] * 64
+    coeffs[0] = dc
+
+    # AC decode
+    idx = 1
+    while idx < 64:
+        node = ac_tree
+        while "sym" not in node:
+            b = bitreader.read(1)
+            node = node.get("1" if b else "0")
+            if node is None:
+                raise ValueError("Invalid AC Huffman code")
+        sym = node["sym"]
+        if sym == 0x00:  # EOB
+            break
+        if sym == 0xF0:  # ZRL
+            idx += 16
+            continue
+        run = (sym >> 4) & 0x0F
+        size = sym & 0x0F
+        idx += run
+        if idx >= 64:
+            break
+        val = _receive_extend_bits(bitreader, size)
+        coeffs[idx] = val
+        idx += 1
+
     block8 = _inverse_zigzag(coeffs)
     return block8
 
@@ -452,3 +739,24 @@ def decode_block_rle(stream_data):
 # 讓 main.py 的 baseline 能繼續運作 (對應到 huff)
 encode_block = encode_block_huff
 decode_block = decode_block_huff
+
+
+# -------------------------------------------------------------------------
+# Signaling cost helpers (for main to add table overhead)
+# -------------------------------------------------------------------------
+
+def get_global_huff_table_bits():
+    """回傳全圖共用 Huffman 的表成本（bits）。"""
+    return _GLOBAL_HUFF_TABLE_BITS
+
+
+def get_shared_dcac_table_bits_total():
+    """
+    回傳 JPEG-like DC/AC 共用表的總 signaling bits（DC+AC，三個分量合計）。
+    """
+    total = 0
+    for comp in _SHARED_DC_TABLE_BITS_MAP:
+        total += _SHARED_DC_TABLE_BITS_MAP.get(comp, 0)
+    for comp in _SHARED_AC_TABLE_BITS_MAP:
+        total += _SHARED_AC_TABLE_BITS_MAP.get(comp, 0)
+    return total

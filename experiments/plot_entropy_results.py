@@ -37,7 +37,7 @@ def plot_entropy_summary(rows, output_path: Path):
     present_methods = {r["method"] for r in rows}
 
     # 以「由簡到複」的方式定義合理的顯示順序
-    preferred_order = ["raw", "rle", "huff", "huff_global", "huff_dpcm"]
+    preferred_order = ["raw", "rle", "huff", "huff_global", "huff_dpcm", "huff_dcac_shared"]
     # 只保留在資料中實際出現的 method，其他略過
     methods = [m for m in preferred_order if m in present_methods]
 

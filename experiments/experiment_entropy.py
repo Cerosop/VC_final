@@ -30,7 +30,7 @@ def run_entropy_comparison(image_path, save_plot=True):
     h_new, w_new = (h // 16) * 16, (w // 16) * 16
     img_arr = img_arr[:h_new, :w_new, :]
 
-    methods = ['raw', 'rle', 'huff', 'huff_global', 'huff_dpcm']
+    methods = ['raw', 'rle', 'huff', 'huff_global', 'huff_dpcm', 'huff_dcac_shared']
     results = []
 
     print(f"{'Method':<10} | {'Size (KB)':<10} | {'Ratio':<8} | {'PSNR (dB)':<10} | {'Enc Time (ms)':<12}")

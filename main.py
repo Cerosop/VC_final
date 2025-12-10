@@ -131,6 +131,55 @@ def jpeg_pipeline(img_arr, dct_method='baseline', idct_method='baseline',
         for q_block in quantized_Cr_blocks:
             stream = encode_block_fn(q_block)
             encoded_data['Cr'].append(stream)
+    elif entropy_method == 'huff_dcac_shared':
+        # ----------------- JPEG-like DC/AC 共用 Huffman 版本 -----------------
+        # 先做 DCT + 量化
+        quantized_Y_blocks = []
+        quantized_Cb_blocks = []
+        quantized_Cr_blocks = []
+
+        entropy.set_current_component('Y')
+        for block in Y_blocks:
+            dct_block = forward_dct_fn(block)
+            q_block = quantize_fn(dct_block, config.Q_Y)
+            quantized_Y_blocks.append(q_block)
+
+        entropy.set_current_component('Cb')
+        for block in Cb_blocks:
+            dct_block = forward_dct_fn(block)
+            q_block = quantize_fn(dct_block, config.Q_C)
+            quantized_Cb_blocks.append(q_block)
+
+        entropy.set_current_component('Cr')
+        for block in Cr_blocks:
+            dct_block = forward_dct_fn(block)
+            q_block = quantize_fn(dct_block, config.Q_C)
+            quantized_Cr_blocks.append(q_block)
+
+        quantized_C_blocks = quantized_Cb_blocks + quantized_Cr_blocks
+
+        # 準備共用 DC/AC Huffman 表
+        entropy.prepare_huff_dcac_shared({
+            'Y': quantized_Y_blocks,
+            'Cb': quantized_Cb_blocks,
+            'Cr': quantized_Cr_blocks,
+        })
+
+        # 編碼
+        entropy.set_current_component('Y')
+        for q_block in quantized_Y_blocks:
+            stream = entropy.encode_block_huff_dcac_shared(q_block)
+            encoded_data['Y'].append(stream)
+
+        entropy.set_current_component('Cb')
+        for q_block in quantized_Cb_blocks:
+            stream = entropy.encode_block_huff_dcac_shared(q_block)
+            encoded_data['Cb'].append(stream)
+
+        entropy.set_current_component('Cr')
+        for q_block in quantized_Cr_blocks:
+            stream = entropy.encode_block_huff_dcac_shared(q_block)
+            encoded_data['Cr'].append(stream)
     else:
         # ----------------- 一般（per-block）版本 -----------------
         # Process Y
@@ -172,8 +221,14 @@ def jpeg_pipeline(img_arr, dct_method='baseline', idct_method='baseline',
     def _sum_bits(streams):
         total = 0
         for s in streams:
-            if isinstance(s, dict) and 'bits' in s and isinstance(s['bits'], str):
-                total += len(s['bits'])
+            if isinstance(s, dict):
+                if 'bits' in s and isinstance(s['bits'], str):
+                    total += len(s['bits'])
+                if 'table_bits' in s:
+                    try:
+                        total += int(s['table_bits'])
+                    except Exception:
+                        pass
             else:
                 # 後備估算：以非零係數數量粗略估計，每個非零給固定 12 bits
                 # 注意：這只是後備方案，真正壓縮應以 bitstream 為準
@@ -184,6 +239,11 @@ def jpeg_pipeline(img_arr, dct_method='baseline', idct_method='baseline',
         return total
 
     total_bits = _sum_bits(encoded_data['Y']) + _sum_bits(encoded_data['Cb']) + _sum_bits(encoded_data['Cr'])
+    # 加上 Huffman 表 signaling 成本
+    if entropy_method == 'huff_global':
+        total_bits += entropy.get_global_huff_table_bits()
+    elif entropy_method == 'huff_dcac_shared':
+        total_bits += entropy.get_shared_dcac_table_bits_total()
     comp_bytes = total_bits / 8.0
     ratio = (orig_bytes / comp_bytes) if comp_bytes > 0 else float('inf')
 

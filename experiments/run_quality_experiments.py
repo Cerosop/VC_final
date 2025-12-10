@@ -209,7 +209,7 @@ def main():
     parser.add_argument(
         "--entropy_method",
         type=str,
-        default="huff",
+        default="huff_dcac_shared",
         help="Entropy coding method to use (default: huff)",
     )
     parser.add_argument(
